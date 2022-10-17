@@ -1,0 +1,118 @@
+---
+title: "Homework 2"
+author: "PSTAT 131/231"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+      
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = FALSE)
+```
+
+## Linear Regression
+
+```{r}
+library(readr)
+library(magrittr)
+abalone<-read_csv('abalone.csv')
+```
+
+### Question 1
+
+Your goal is to predict abalone age, which is calculated as the number of rings plus 1.5. Notice there currently is no `age` variable in the data set. Add `age` to the data set.
+
+Assess and describe the distribution of `age`.
+
+```{r}
+abalone$age<-abalone$rings+1.5
+plot(abalone$age)
+boxplot(abalone$age)
+```
+The most of abalone are about 10 years old, and a few reach 30.
+
+### Question 2
+
+Split the abalone data into a training set and a testing set. Use stratified sampling. You should decide on appropriate percentages for splitting the data.
+
+*Remember that you'll need to set a seed at the beginning of the document to reproduce your results.*
+```{r}
+set.seed(123)
+abalone_splitting<-sample(c(TRUE, FALSE), nrow(abalone), replace=TRUE, prob=c(0.7,0.3))
+training_set<-abalone[abalone_splitting,]
+test_set<-abalone[!abalone_splitting,]
+dim(abalone)
+dim(training_set)
+dim(test_set)
+```
+### Question 3
+
+Because the relationship between rings and age is only 1.5 difference, not proportional, we cannot use rings to predict age.
+
+
+```{r}
+library(recipes)
+abalone_recipe<-recipe(age~ ., data=training_set) 
+step_dummy(abalone_recipe,all_nominal_predictors())
+step_interact(abalone_recipe,terms=~type:shucked_weight)
+step_interact(abalone_recipe,terms=~longest_shell:diameter) 
+step_interact(abalone_recipe,terms=~shucked_weight:shell_weight)
+step_center(abalone_recipe,all_predictors())
+step_scale(abalone_recipe,all_predictors())
+```
+
+
+### Question 4
+
+Create and store a linear regression object using the `"lm"` engine.
+```{r}
+library(parsnip)
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+```
+
+### Question 5
+
+```{r}
+library(workflows)
+library(workflowsets)
+lm_wflow <- workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(abalone_recipe)
+```
+
+### Question 6
+
+```{r}
+library(generics)
+lm_fit <- fit(lm_wflow, training_set)
+extract_fit_parsnip(lm_fit)
+```
+
+
+### Question 7
+
+```{r}
+train_res <- predict(lm_fit, new_data=training_set %>% select(-age))
+train_res %>%
+  head()
+```
+
+```{r}
+train_res<- bind_cols(train_res, training_set %>% select(age))
+train_res %>%
+  head()
+```
+
+```{r}
+library(yardstick)
+rmse(train_res, truth = age, estimate = .pred)
+metrics <- metric_set(rmse, rsq, mae)
+metrics(train_res, truth = age, estimate = .pred)
+```
+
+
