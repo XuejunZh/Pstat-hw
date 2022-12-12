@@ -1,0 +1,345 @@
+---
+title: "p131 final project"
+author: "Xuejun Zhao"
+date: "2022-12-03"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      df_print: paged
+      code_folding: show
+    pdf_document:
+      latex_engine: xelatex
+      number_sections: no
+fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(VIM)
+library(tune)
+library(naniar)
+library(psych)
+library(knitr)
+library(skimr) # data visualization
+library(baguette) # bagged trees
+library(future) # parallel processing & decrease computation time
+library(xgboost) # boosted trees
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(recipes)
+library(rsample)
+library(glmnet)
+library(parsnip)
+library(workflows)
+library(yardstick)
+library(klaR)
+library(kknn)
+tidymodels_prefer()
+```
+
+
+## Introduction
+
+The World Population Data Set contains Height, Weight, IQ, Quality of Life etc. This paper intends to analyze which factors affect the life span of the population through characteristics. Based on these characteristics, the life prediction is made by machine learning.The basic information of the feature is as follows.Most of the features are numeric. Country is a character feature.
+
+```{r}
+getwd()
+Population <- read.csv("df.csv",header=TRUE,sep = ",")
+Population <- Population[,c(2:25)]
+Population['life_expectancy']<-(Population['male_life_expectancy']+Population['female_life_expectancy'])/2
+str(Population)
+```
+
+
+## Missing value processing
+
+ Through analysis, we can see that some features have missing values. This paper deletes the features with a large proportion of missing values.The rest is filled by average value.
+ 
+ The deleted features:"area","pop_per_km_sq","male_life_expectancy","female_life_expectancy","population".At the same time, we turn character data into factor.
+
+```{r}
+options(digits = 2)
+Population <- mutate_if(Population, is.character, as.factor)
+Population <- mutate_if(Population, is.numeric, as.integer)
+knitr::kable(Population %>% 
+  miss_var_summary(), format="html")
+Population1 <- Population %>% select(-c("area","pop_per_km_sq","male_life_expectancy","female_life_expectancy","population"))
+Population1$education_expenditure_per_inhabitant<-as.numeric(gsub(",","",Population1$education_expenditure_per_inhabitant))
+Population2 <- Population1 %>% 
+  map_dfc(~ replace_na(.x, rstatix::get_mode(.x)[1]))
+knitr::kable(Population2 %>% 
+  miss_var_summary(), format="html")
+```
+
+## Exploratory data analysis
+
+ For the convenience of analysis, we divide the data into numerical data and character data. The skim function from the skimr package produces the summary output below, showing that we have 115 observations and 20 variables. There are 1 character variables and 19 numeric.
+
+```{r}
+Population_count <- data.frame(Population2[, sapply(Population2, is.numeric)])
+Population_factor <- Population2[, sapply(Population2, is.factor)]
+skim(Population2)
+```
+
+## Exploring Target Variable
+
+ We use hist plot to analyze the distribution of the target variable.From the figure,the distribution of the target variable is skewed.
+ 
+```{r}
+hist(Population_count[, c('life_expectancy')], main = 'life_expectancy', xlab = "",col = 'salmon')
+```
+
+## Exploring Numerical Variables
+ 
+From the box plots as follows.we can see that some numerical variables have outliers.We use IQR method to handle these outliers. IQR is the difference between the upper quartile and the lower quartile However, we stipulate that the point exceeding (upper quartile +1.5 times IQR distance or lower quartile-1.5 times IQR distance) is an outlier according to the standard of 1.5 times IQR .Then replace the outlier with the mean value.
+
+```{r}
+cols = c('education_expenditure_per_inhabitant','birth_rate','death_rate','popularity','safety','climate','iq')
+par(mfrow = c(2, 4))
+names <- names(Population_count[,cols])
+for (i in names) {
+  boxplot(Population_count[, i], main = i,col = 'darkorange')
+}
+for (i in cols){
+  Q3 <- quantile(Population_count[,i], 0.95)
+  Q1 <- quantile(Population_count[,i], 0.05)
+  IQR <- Q3 - Q1
+  s1 <- Q1 - 1.5 * IQR
+  s2 <- Q3 + 1.5 * IQR
+  value = mean(Population_count[,i])
+  Population_count[,i] <- ifelse(Population_count[,i]<s1|Population_count[,i]>s2,value,Population_count[,i])
+}
+```
+
+
+Next, let's look at the correlation of variables as shown in the following figure We find that some variables are highly correlated, so it is necessary to reduce the dimension before predicting.
+
+```{r ,fig.height=10, fig.width=10}
+correlations <- cor(Population_count,method="pearson")
+corrplot(correlations, number.cex = .9, method = "circle", type = "upper", tl.cex=0.8,tl.col = "black")
+```
+
+## PCA
+
+ The dimensionality reduction by principal component analysis shows that the interpretability of variance is 91% when 8 principal components are retained.
+
+```{r}
+pca <- prcomp(Population_count[,-c(19)], scale = TRUE) 
+screeplot(pca,col = 'salmon',main = '')
+gof <- (pca$sdev)^2/sum((pca$sdev)^2)
+sum(gof[1:8])
+Population_pca <- pca$x[,c(1:8)]
+```
+
+## Data Processing
+
+Next, we convert country to numeric data through the function step_dummy.
+
+```{r}
+X<-data.frame(Population_pca,Population_factor,Population_count['life_expectancy'])
+X<-as_tibble(X)
+model_recipe <- 
+  recipe(life_expectancy ~ ., data = X) %>%
+  step_dummy(country, one_hot = TRUE)
+```
+
+## Data Spliting-Cross Validation
+
+ Before modeling, we divide the data into training set and test set, in which training set accounts for 80%.The cross-validation randomly splits the data into 5 groups of roughly equal size. The number of resamples is equal to five. Variable resp is used to conduct stratified sampling to create the folds.
+
+```{r}
+set.seed(123)
+X_split <- initial_split(X, prop = 0.8, strata = "life_expectancy")
+X_train <- training(X_split)
+X_test  <- testing(X_split)
+set.seed(456)
+l_cv <- vfold_cv(X_train, v = 5,strata = "life_expectancy") # Cross validation
+
+```
+
+
+## Modeling
+
+ We used four models. They are glmnet (lasso), knn, descent tree and random forest.All models seemed to perform comparatively well and we did everything using tidymodels.recipes packages was used for data pre-processing.parnsip was used for estimation (more precisely as a wrapper around the individual modeling packages).rsample was used to split the data for cross validation.tune and dials were used for parameter tuning.workflows was used to put it all together.This worked great from a usability perspective. Trying different models and tuning their parameters was all done using the same interface.
+
+### model-1 lasso regression
+
+```{r}
+# Lasso Regression
+lin_model <- 
+  linear_reg(mode = "regression",
+             penalty = tune(),
+             mixture = 1,
+             engine = "glmnet"
+  )
+lin_wf <-
+  workflow() %>%
+  add_model(lin_model) %>% 
+  add_recipe(model_recipe)
+# Hyperparameter Tuning
+lin_results <-
+  lin_wf %>% 
+  tune_grid(resamples = l_cv,
+            metrics = metric_set(rsq, rmse, mae)
+  )
+lin_wf
+autoplot(lin_results)
+collect_metrics(lin_results)
+# Final Hyperparameter
+param_final <- lin_results %>%
+  select_best(metric = "mae")
+lin_wf <- lin_wf %>%
+  finalize_workflow(param_final)
+# last fit
+lin_fit <- lin_wf %>%
+     last_fit(X_split)
+# Test Data Predictions
+test_performance <- lin_fit %>% collect_predictions()
+# Performance metrics
+auto_metrics <- metric_set(rsq, rmse, mae)
+x1 <- auto_metrics(data = test_performance, truth = life_expectancy, estimate = .pred)
+x1['model'] <- 'lasso'
+x1
+```
+
+### model-2 KNN
+
+```{r}
+# K - Nearest Neighbor
+knn_model <- 
+  nearest_neighbor( mode = "regression",
+                    neighbors = tune(),
+                    weight_func = tune(),
+                    dist_power = tune(),
+                    engine = "kknn"
+  )
+knn_wf <-
+  workflow() %>%
+  add_model(knn_model) %>% 
+  add_recipe(model_recipe)
+knn_wf
+# Hyperparameter Tuning
+knn_results <-
+  knn_wf %>% 
+  tune_grid(resamples = l_cv,
+            metrics = metric_set(rsq, rmse, mae)
+  )
+autoplot(knn_results)
+collect_metrics(knn_results)
+# Final Hyperparameter
+param_final <- knn_results %>%
+  select_best(metric = "mae")
+knn_wf <- knn_wf %>%
+  finalize_workflow(param_final)
+# last fit
+knn_fit <- knn_wf %>%
+  last_fit(X_split)
+# Test Data Predictions
+test_performance <- knn_fit %>% collect_predictions()
+# Performance metrics
+auto_metrics <- metric_set(rsq, rmse, mae)
+x2 <- auto_metrics(data = test_performance, truth =  life_expectancy, estimate = .pred)
+x2['model'] <- 'knn'
+x2
+```
+
+### model-3 descision tree
+
+```{r}
+# Decision Trees
+dt_model <- 
+  decision_tree(mode = "regression",
+                cost_complexity = tune(),
+                tree_depth = tune(),
+                min_n = tune(),
+                engine = "rpart"
+  )
+dt_wf <-
+  workflow() %>%
+  add_model(dt_model) %>% 
+  add_recipe(model_recipe)
+dt_wf
+# Hyperparameter Tuning
+dt_results <-
+  dt_wf %>% 
+  tune_grid(resamples = l_cv,
+            metrics = metric_set(rsq, rmse, mae)
+  )
+autoplot(dt_results)
+collect_metrics(dt_results)
+# Final Hyperparameter
+param_final <- dt_results %>%
+  select_best(metric = "mae")
+dt_wf <- dt_wf %>%
+  finalize_workflow(param_final)
+# last fit
+dt_fit <- dt_wf %>%
+  last_fit(X_split)
+# Test Data Predictions
+test_performance <- dt_fit %>% collect_predictions()
+# Performance metrics
+auto_metrics <- metric_set(rsq, rmse, mae)
+x3 <- auto_metrics(data = test_performance, truth = life_expectancy, estimate = .pred)
+x3['model'] <- 'decision tree'
+x3
+```
+
+
+### model-4 random forest
+
+```{r}
+# Random Forest
+rf_model <- 
+  rand_forest(mode = "regression",
+              mtry = tune(),
+              trees = tune(),
+              min_n = tune(),
+              engine = "ranger"
+  )
+rf_wf <-
+  workflow() %>%
+  add_model(rf_model) %>% 
+  add_recipe(model_recipe)
+rf_wf
+# Hyperparameter Tuning
+rf_results <-
+  rf_wf %>% 
+  tune_grid(resamples = l_cv,
+            metrics = metric_set(rsq, rmse, mae)
+  )
+autoplot(rf_results)
+collect_metrics(rf_results)
+# Final Hyperparameter
+param_final <- rf_results %>%
+  select_best(metric = "mae")
+rf_wf <- rf_wf %>%
+  finalize_workflow(param_final)
+# last fit
+rf_fit <- rf_wf %>%
+  last_fit(X_split)
+# Test Data Predictions
+test_performance <- rf_fit %>% collect_predictions()
+# Performance metrics
+auto_metrics <- metric_set(rsq, rmse, mae)
+x4 = auto_metrics(data = test_performance, truth = life_expectancy, estimate = .pred)
+x4['model'] = 'random forest'
+```
+
+
+
+## Conclusion
+
+We use rsq, rmse and mae to evaluate the prediction effect of the four models. The rmse of KNN is the smallest.So that,the performance of KNN is the best, followed by random forest and lasso.
+
+```{r}
+bind_rows(x1)
+bind_rows(x2)
+bind_rows(x3)
+bind_rows(x4)
+```
+
